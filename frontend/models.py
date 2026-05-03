@@ -60,6 +60,8 @@ class Room(Base, TimestampMixin):
     room_code: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)
     area_m2: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
     khu_vuc: Mapped[str] = mapped_column(String(100), nullable=False)
+    latitude: Mapped[float | None] = mapped_column(Numeric(10, 7), nullable=True)
+    longitude: Mapped[float | None] = mapped_column(Numeric(10, 7), nullable=True)
     tang: Mapped[int] = mapped_column(default=1, nullable=False)
     address: Mapped[str | None] = mapped_column(String(255), nullable=True)
     current_rent: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)

@@ -7,10 +7,10 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
-from sqlalchemy import select
+from sqlalchemy import delete, func, or_, select, update
 
 from dependencies import get_db, require_admin, get_current_user
-from models import User
+from models import AuditLog, Contract, Notification, Room, Tenant, User
 from schemas import UserOut, UserStatusUpdate
 
 router = APIRouter()
@@ -66,3 +66,49 @@ def update_user_status(
     db.flush()
     db.refresh(user)
     return user
+
+
+@router.delete("/{user_id}", summary="XoÃ¡ tÃ i khoáº£n (Admin)")
+def delete_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    if user_id == admin.user_id:
+        raise HTTPException(400, "KhÃ´ng thá»ƒ xÃ³a tÃ i khoáº£n cá»§a chÃ­nh mÃ¬nh")
+
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(404, "KhÃ´ng tÃ¬m tháº¥y tÃ i khoáº£n")
+    if user.role == "admin":
+        raise HTTPException(400, "KhÃ´ng cho phÃ©p xÃ³a tÃ i khoáº£n admin")
+
+    owned_room_count = db.scalar(select(func.count(Room.room_id)).where(Room.owner_id == user_id)) or 0
+    if owned_room_count > 0:
+        raise HTTPException(409, f"KhÃ´ng thá»ƒ xÃ³a: user Ä‘ang sá»Ÿ há»¯u {owned_room_count} phÃ²ng")
+
+    tenant = db.execute(select(Tenant).where(Tenant.user_id == user_id)).scalar_one_or_none()
+    if tenant:
+        active_contracts = db.scalar(
+            select(func.count(Contract.contract_id)).where(
+                Contract.tenant_id == tenant.tenant_id,
+                Contract.status == "active",
+            )
+        ) or 0
+        if active_contracts > 0:
+            raise HTTPException(409, "KhÃ´ng thá»ƒ xÃ³a: user Ä‘ang liÃªn káº¿t ngÆ°á»i thuÃª cÃ³ há»£p Ä‘á»“ng active")
+        tenant.user_id = None
+
+    db.execute(
+        update(AuditLog)
+        .where(AuditLog.actor_user_id == user_id)
+        .values(actor_user_id=None)
+    )
+    db.execute(
+        delete(Notification).where(
+            or_(Notification.sender_id == user_id, Notification.recipient_id == user_id)
+        )
+    )
+    db.delete(user)
+    db.flush()
+    return {"message": "ÄÃ£ xÃ³a tÃ i khoáº£n", "user_id": user_id}

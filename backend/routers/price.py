@@ -12,6 +12,7 @@ from sqlalchemy import select
 from dependencies import get_db, get_current_user
 from models import PriceSuggestion, Room, User
 from schemas import PriceSuggestionOut
+from services.pricing_service import persist_price_suggestion
 
 router = APIRouter()
 
@@ -40,3 +41,15 @@ def room_suggestions(
         .where(PriceSuggestion.room_id == room_id)
         .order_by(PriceSuggestion.suggestion_id.desc())
     ).scalars().all()
+
+
+@router.post("/room/{room_id}/generate", response_model=PriceSuggestionOut, summary="Táº¡o gá»£i Ã½ giÃ¡ má»›i cho phÃ²ng")
+def generate_room_suggestion(
+    room_id: int,
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+):
+    room = db.get(Room, room_id)
+    if not room:
+        raise HTTPException(404, "KhÃ´ng tÃ¬m tháº¥y phÃ²ng")
+    return persist_price_suggestion(db, room)

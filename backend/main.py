@@ -11,6 +11,7 @@ import sys
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import inspect, text
 
 _BACKEND_DIR = os.path.abspath(os.path.dirname(__file__))
 _PROJECT_DIR = os.path.abspath(os.path.join(_BACKEND_DIR, "..", "frontend"))
@@ -20,7 +21,8 @@ for _path in (_BACKEND_DIR, _PROJECT_DIR):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
-from routers import ai, audit, auth, contracts, dashboard, notifications, payments, price, rooms, tenants, users
+from routers import audit, auth, contracts, dashboard, notifications, payments, price, rooms, tenants, users
+from db import engine
 
 app = FastAPI(
     title="Tro Gia API",
@@ -52,7 +54,25 @@ app.include_router(users.router, prefix="/api/users", tags=["Users"])
 app.include_router(notifications.router, prefix="/api/notifications", tags=["Notifications"])
 app.include_router(price.router, prefix="/api/price-suggestions", tags=["Price Suggestions"])
 app.include_router(audit.router, prefix="/api/audit-logs", tags=["Audit Logs"])
-app.include_router(ai.router, prefix="/api/ai", tags=["AI"])
+
+
+@app.on_event("startup")
+def ensure_room_geo_columns() -> None:
+    inspector = inspect(engine)
+    if "rooms" not in inspector.get_table_names():
+        return
+    columns = {col["name"] for col in inspector.get_columns("rooms")}
+    with engine.begin() as conn:
+        if "latitude" not in columns:
+            if engine.dialect.name == "sqlite":
+                conn.execute(text("ALTER TABLE rooms ADD COLUMN latitude NUMERIC(10,7)"))
+            else:
+                conn.execute(text("ALTER TABLE rooms ADD COLUMN latitude DECIMAL(10,7) NULL"))
+        if "longitude" not in columns:
+            if engine.dialect.name == "sqlite":
+                conn.execute(text("ALTER TABLE rooms ADD COLUMN longitude NUMERIC(10,7)"))
+            else:
+                conn.execute(text("ALTER TABLE rooms ADD COLUMN longitude DECIMAL(10,7) NULL"))
 
 
 @app.get("/", tags=["Health"])

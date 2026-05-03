@@ -81,6 +81,8 @@ class RoomOut(BaseModel):
     room_code: str
     area_m2: float
     khu_vuc: str
+    latitude: Optional[float]
+    longitude: Optional[float]
     tang: int
     address: Optional[str]
     current_rent: float
@@ -101,6 +103,8 @@ class RoomCreate(BaseModel):
     room_code: str
     area_m2: float
     khu_vuc: str
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
     tang: int = 1
     address: Optional[str] = None
     current_rent: float = 0
@@ -114,6 +118,8 @@ class RoomCreate(BaseModel):
 class RoomUpdate(BaseModel):
     area_m2: Optional[float] = None
     khu_vuc: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
     tang: Optional[int] = None
     address: Optional[str] = None
     current_rent: Optional[float] = None

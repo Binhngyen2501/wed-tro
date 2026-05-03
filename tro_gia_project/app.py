@@ -7,6 +7,7 @@ import io
 import json
 import os
 import re
+import requests
 import time
 import uuid
 import urllib.parse
@@ -23,6 +24,11 @@ try:
     GENAI_AVAILABLE = True
 except ImportError:
     GENAI_AVAILABLE = False
+try:
+    from openai import OpenAI  # type: ignore
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -49,9 +55,11 @@ from sqlalchemy import (
     String,
     Text,
     create_engine,
+    delete as sql_delete,
     func,
     or_,
     select,
+    update as sql_update,
 )
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, joinedload, mapped_column, relationship, sessionmaker
@@ -93,7 +101,7 @@ def serialize_model(model: Any) -> dict[str, Any]:
 
 load_dotenv()
 
-APP_NAME = os.getenv("APP_NAME", "Hệ thống quản lý phòng trọ và gợi ý giá thuê")
+APP_NAME = os.getenv("APP_NAME", "Hệ thống quản lý quản lý phòng trọ và giá thu")
 APP_NAME = APP_NAME.replace("quản lý giá phòng trọ", "quản lý phòng trọ")
 DATABASE_URL = os.getenv("DATABASE_URL", "mysql+pymysql://root:@127.0.0.1:3306/boarding_house")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
@@ -110,12 +118,14 @@ BANK_NAME = os.getenv("BANK_NAME", "")               # Tên ngân hàng (VD: VCB
 BANK_ACCOUNT_NAME = os.getenv("BANK_ACCOUNT_NAME", MOMO_NAME)  # Tên chủ tài khoản
 
 GEMINI_API_KEY = ""  # API key must be entered by user - old key was leaked
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+LATE_FEE_MARKER = "[late_fee_applied]"
 
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 
 st.set_page_config(
-    page_title=APP_NAME,
-    page_icon=None,
+    page_title="Phòng trọ",
+    page_icon="🏠",
     layout="wide",
     initial_sidebar_state="expanded",
     menu_items={
@@ -323,6 +333,67 @@ REGION_BENCHMARKS = {
     "trung tâm": {"market_min": 3_200_000, "market_avg": 4_000_000, "market_max": 5_500_000, "reference": "Khảo sát thủ công"},
     "cận trung tâm": {"market_min": 2_600_000, "market_avg": 3_300_000, "market_max": 4_400_000, "reference": "Khảo sát thủ công"},
     "ngoại thành": {"market_min": 2_000_000, "market_avg": 2_700_000, "market_max": 3_700_000, "reference": "Khảo sát thủ công"},
+}
+
+# Mapping districts to area categories for pricing
+DISTRICT_TO_AREA = {
+    # Trung tâm
+    "Quận 1": "trung tâm",
+    "Quận 3": "trung tâm",
+    "Quận 5": "trung tâm",
+    "Quận Bình Thạnh": "trung tâm",
+    "Quận Phú Nhuận": "trung tâm",
+    "Quận 10": "trung tâm",
+    "Quận 4": "trung tâm",
+    "Quận Tân Bình": "trung tâm",
+    "Quận Gò Vấp": "trung tâm",
+    # Cận trung tâm
+    "Quận 2": "cận trung tâm",
+    "Quận 7": "cận trung tâm",
+    "Quận 9": "cận trung tâm",
+    "Quận Thủ Đức": "cận trung tâm",
+    "Quận Bình Tân": "cận trung tâm",
+    "Quận Tân Phú": "cận trung tâm",
+    "Huyện Bình Chánh": "cận trung tâm",
+    # Ngoại thành
+    "Huyện Hóc Môn": "ngoại thành",
+    "Huyện Củ Chi": "ngoại thành",
+    "Huyện Nhà Bè": "ngoại thành",
+    "Huyện Cần Giờ": "ngoại thành",
+    "Quận 12": "ngoại thành",
+    "Quận 11": "ngoại thành",
+    "Quận 6": "ngoại thành",
+    "Quận 8": "ngoại thành",
+}
+
+DISTRICTS = list(DISTRICT_TO_AREA.keys())
+
+# Detailed pricing per district (per m²)
+DISTRICT_PRICING = {
+    "Quận 1": {"min": 180_000, "avg": 220_000, "max": 280_000},
+    "Quận 3": {"min": 160_000, "avg": 200_000, "max": 250_000},
+    "Quận 5": {"min": 140_000, "avg": 170_000, "max": 210_000},
+    "Quận Bình Thạnh": {"min": 150_000, "avg": 190_000, "max": 240_000},
+    "Quận Phú Nhuận": {"min": 160_000, "avg": 200_000, "max": 250_000},
+    "Quận 10": {"min": 130_000, "avg": 165_000, "max": 200_000},
+    "Quận 4": {"min": 140_000, "avg": 175_000, "max": 220_000},
+    "Quận Tân Bình": {"min": 120_000, "avg": 150_000, "max": 190_000},
+    "Quận Gò Vấp": {"min": 110_000, "avg": 140_000, "max": 180_000},
+    "Quận 2": {"min": 130_000, "avg": 165_000, "max": 210_000},
+    "Quận 7": {"min": 140_000, "avg": 180_000, "max": 230_000},
+    "Quận 9": {"min": 90_000, "avg": 120_000, "max": 160_000},
+    "Quận Thủ Đức": {"min": 100_000, "avg": 130_000, "max": 170_000},
+    "Quận Bình Tân": {"min": 85_000, "avg": 115_000, "max": 150_000},
+    "Quận Tân Phú": {"min": 90_000, "avg": 120_000, "max": 155_000},
+    "Huyện Bình Chánh": {"min": 70_000, "avg": 100_000, "max": 140_000},
+    "Huyện Hóc Môn": {"min": 60_000, "avg": 85_000, "max": 120_000},
+    "Huyện Củ Chi": {"min": 50_000, "avg": 75_000, "max": 110_000},
+    "Huyện Nhà Bè": {"min": 55_000, "avg": 80_000, "max": 115_000},
+    "Huyện Cần Giờ": {"min": 40_000, "avg": 60_000, "max": 90_000},
+    "Quận 12": {"min": 80_000, "avg": 110_000, "max": 145_000},
+    "Quận 11": {"min": 95_000, "avg": 125_000, "max": 160_000},
+    "Quận 6": {"min": 90_000, "avg": 120_000, "max": 155_000},
+    "Quận 8": {"min": 85_000, "avg": 115_000, "max": 150_000},
 }
 AMENITY_LABELS = {
     "has_aircon": "Máy lạnh",
@@ -717,6 +788,90 @@ def to_decimal(value: Any) -> Decimal:
 def money(value: Any) -> str:
     amount = int(Decimal(str(value)).quantize(Decimal("1")))
     return f"{amount:,.0f} VNĐ"
+
+
+def overdue_days_from_period(period: str, due_day: int = 5) -> int:
+    """Tính số ngày quá hạn theo kỳ YYYY-MM."""
+    try:
+        due_date = datetime.strptime(period + "-01", "%Y-%m-%d").date().replace(day=due_day)
+    except ValueError:
+        return 0
+    return max((date.today() - due_date).days, 0)
+
+
+def append_note(base_note: str | None, extra: str) -> str:
+    base = (base_note or "").strip()
+    return f"{base}\n{extra}".strip() if base else extra
+
+
+def _history_to_openai_messages(
+    chat_history: list[dict[str, Any]],
+    system_instruction: str,
+    prompt: str,
+) -> list[dict[str, str]]:
+    messages: list[dict[str, str]] = [{"role": "system", "content": system_instruction}]
+    for msg in chat_history:
+        role = "assistant" if msg.get("role") == "model" else "user"
+        text = (msg.get("parts") or [{}])[0].get("text", "")
+        if text:
+            messages.append({"role": role, "content": text})
+    messages.append({"role": "user", "content": prompt})
+    return messages
+
+
+def _call_ai_chat(
+    provider: str,
+    api_key: str,
+    prompt: str,
+    chat_history: list[dict[str, Any]],
+    system_instruction: str,
+    temperature: float,
+) -> str:
+    if provider == "openai":
+        messages = _history_to_openai_messages(chat_history, system_instruction, prompt)
+        if OPENAI_AVAILABLE:
+            client = OpenAI(api_key=api_key)
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=messages,
+                temperature=temperature,
+            )
+            return (response.choices[0].message.content or "").strip() or "Không có phản hồi."
+
+        # Fallback nếu thiếu SDK openai
+        resp = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "gpt-4o-mini",
+                "messages": messages,
+                "temperature": temperature,
+            },
+            timeout=60,
+        )
+        if resp.status_code >= 400:
+            raise RuntimeError(f"OpenAI API lỗi {resp.status_code}: {resp.text[:300]}")
+        data = resp.json()
+        return (data.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip() or "Không có phản hồi."
+
+    if not GENAI_AVAILABLE:
+        raise RuntimeError("Thiếu thư viện google-genai.")
+    client = genai.Client(api_key=api_key)
+    history_for_api = []
+    for m in chat_history:
+        history_for_api.append(types.Content(role=m["role"], parts=[types.Part(text=m["parts"][0]["text"])]))
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=history_for_api + [prompt],
+        config=types.GenerateContentConfig(
+            system_instruction=system_instruction,
+            temperature=temperature,
+        ),
+    )
+    return (response.text or "").strip() or "Không có phản hồi."
 
 
 def serialize_model(obj: Any) -> dict[str, Any]:
@@ -1159,9 +1314,53 @@ def inject_global_styles() -> None:
     st.markdown("""
 <style>
 
+/* FIX FONT TIẾNG VIỆT */
+* {
+    font-family: 'Segoe UI', 'Roboto', 'Helvetica Neue', Arial, sans-serif !important;
+}
+
+/* Fix content padding to avoid overlap */
+[data-testid="stAppViewContainer"] {
+    padding-top: 1rem !important;
+}
+
+[data-testid="stSidebar"] {
+    padding-top: 1rem !important;
+}
+
+/* Fix all Streamlit text elements */
+.stMarkdown, .stTitle, .stHeader, .stText, 
+.stSelectbox, .stNumberInput, .stTextInput,
+.stButton, .stCheckbox, .stRadio, .stTabs,
+.css-1n76uvr, .css-1p2r3m, .css-1x8cf1, .css-1xarl3l,
+p, h1, h2, h3, h4, h5, h6, span, div, label {
+    font-family: 'Segoe UI', 'Roboto', 'Helvetica Neue', Arial, sans-serif !important;
+}
+
+/* Fix sidebar and navigation */
+.css-1d391kg, .css-12oz5g7, .css-1v0mbdj {
+    font-family: 'Segoe UI', 'Roboto', 'Helvetica Neue', Arial, sans-serif !important;
+}
+
+/* Fix metrics and data display */
+.css-1xarl3l, .css-1wivjn2 {
+    font-family: 'Segoe UI', 'Roboto', 'Helvetica Neue', Arial, sans-serif !important;
+}
+
 /* FIX HIỂN THỊ CHỮ LUÔN */
 [data-testid="stSidebar"] .stButton > button * {
     color: black !important;
+}
+
+/* Fix hero and titles specifically */
+.hero, .hero h1, .hero h2, .hero h3,
+[data-testid="stAppViewContainer"] h1,
+[data-testid="stAppViewContainer"] h2,
+[data-testid="stAppViewContainer"] h3,
+[data-testid="stAppViewContainer"] p,
+[data-testid="stAppViewContainer"] span,
+[data-testid="stAppViewContainer"] div {
+    font-family: 'Segoe UI', 'Roboto', 'Helvetica Neue', Arial, sans-serif !important;
 }
 
 /* nền sáng hơn để thấy chữ */
@@ -1185,7 +1384,7 @@ def inject_global_styles() -> None:
 
 
 def hero(title: str) -> None:
-    st.markdown(f"<div class='hero'><h1>{title}</h1></div>", unsafe_allow_html=True)
+    pass  # Removed to avoid font issues
 
 
 def section_header(title: str, desc: str | None = None) -> None:
@@ -1255,7 +1454,6 @@ def sidebar_menu(user: SessionUser) -> str:
                 "Gợi ý giá thuê",
                 "Audit Log",
                 "Quản lý User",
-                "Trợ lý AI",
             ]
         else:
             options = [
@@ -1263,7 +1461,6 @@ def sidebar_menu(user: SessionUser) -> str:
                 "Gợi ý giá thuê",
                 "Hợp đồng của tôi",
                 "Hóa đơn của tôi",
-                "Trợ lý AI",
             ]
 
         # Use session state for menu selection
@@ -1342,7 +1539,7 @@ def render_auth_screen() -> None:
             """
             <div style="text-align: center; margin-bottom: 2rem;">
                 <div style="font-size: 4rem; margin-bottom: 0.5rem;">🏠</div>
-                <h1 style="color: #0f172a; margin: 0; font-size: 1.75rem; font-weight: 700;">Tro Gia</h1>
+                <h1 style="color: #0f172a; margin: 0; font-size: 1.75rem; font-weight: 700;">QLPT & Giá Thuê</h1>
                 <p style="color: #64748b; margin: 0.5rem 0 0;">Hệ thống quản lý phòng trọ thông minh</p>
             </div>
             """,
@@ -1432,7 +1629,7 @@ def render_auth_screen() -> None:
             st.markdown(
                 """
                 <div style="text-align: center; margin-top: 2rem; color: #94a3b8; font-size: 0.875rem;">
-                    © 2025 Tro Gia. All rights reserved.
+                    © 2025 QLPT. All rights reserved.
                 </div>
                 """,
                 unsafe_allow_html=True,
@@ -1544,16 +1741,40 @@ def render_rooms(user: SessionUser) -> None:
 
     with tabs[0]:
         images_add = st.file_uploader("Hình ảnh phòng", accept_multiple_files=True, type=['png', 'jpg', 'jpeg'], key="add_room_images")
+        
+        # Price suggestion section in expander
+        with st.expander("💰 Gợi ý định giá thuê trọ", expanded=True):
+            col_price1, col_price2, col_price3 = st.columns([2, 1, 2])
+            with col_price1:
+                district_for_price = st.selectbox("Quận/Huyện", DISTRICTS, key="district_price_suggest")
+            with col_price2:
+                area_for_price = st.number_input("Diện tích (m²)", min_value=1.0, value=20.0, step=1.0, key="area_price_suggest")
+            
+            # Calculate price suggestion
+            if district_for_price in DISTRICT_PRICING:
+                pricing = DISTRICT_PRICING[district_for_price]
+                suggested_min = pricing["min"] * area_for_price
+                suggested_avg = pricing["avg"] * area_for_price
+                suggested_max = pricing["max"] * area_for_price
+                
+                with col_price3:
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("Thấp nhất", money(suggested_min), delta=f"-{money(suggested_avg - suggested_min)}", delta_color="inverse")
+                    m2.metric("Trung bình", money(suggested_avg))
+                    m3.metric("Cao nhất", money(suggested_max), delta=f"+{money(suggested_max - suggested_avg)}")
+        
+        st.markdown("#### 📝 Thông tin phòng")
+        
         with st.form("add_room_form"):
             c1, c2 = st.columns(2)
             with c1:
                 room_code = st.text_input("Mã phòng")
                 area_m2 = st.number_input("Diện tích (m²)", min_value=1.0, value=20.0, step=1.0)
-                khu_vuc = st.selectbox("Khu vực", list(REGION_BENCHMARKS.keys()))
+                khu_vuc = st.selectbox("Quận/Huyện", DISTRICTS)
                 tang = st.number_input("Tầng", min_value=1, value=1, step=1)
             with c2:
                 address = st.text_input("Địa chỉ")
-                current_rent = st.number_input("Giá hiện tại", min_value=0.0, value=2500000.0, step=100000.0)
+                current_rent = st.number_input("Giá thuê (VNĐ)", min_value=0.0, value=2500000.0, step=100000.0)
                 st.write("")
                 a1, a2, a3 = st.columns(3)
                 has_aircon = a1.checkbox("Máy lạnh")
@@ -1648,8 +1869,12 @@ def render_rooms(user: SessionUser) -> None:
                         with c1:
                             room_code = st.text_input("Mã phòng", value=room.room_code or "")
                             area_m2 = st.number_input("Diện tích (m²)", min_value=1.0, value=float(room.area_m2), step=1.0)
+                            # Handle legacy data - if room.khu_vuc is an area category, default to first district
+                            default_district_index = 0
+                            if room.khu_vuc in DISTRICTS:
+                                default_district_index = DISTRICTS.index(room.khu_vuc)
                             khu_vuc = st.selectbox(
-                                "Khu vực", list(REGION_BENCHMARKS.keys()), index=list(REGION_BENCHMARKS.keys()).index(room.khu_vuc)
+                                "Quận/Huyện", DISTRICTS, index=default_district_index
                             )
                             tang = st.number_input("Tầng", min_value=1, value=int(room.tang), step=1)
                         with c2:
@@ -1784,8 +2009,8 @@ def render_rooms(user: SessionUser) -> None:
 
 def render_tenants(user: SessionUser) -> None:
     hero(APP_NAME)
-    section_header("Quản lý người thuê", "Lưu hồ sơ người thuê và liên kết với tài khoản người dùng khi cần.")
-    tabs = st.tabs(["Thêm", "Sửa", "Xóa", "Danh sách"])
+    section_header("Quản lý người thuê", "Lưu hồ sơ, xử lý quá hạn và liên kết tài khoản.")
+    tabs = st.tabs(["Thêm", "Sửa", "Xóa", "Phạt quá hạn", "Danh sách"])
     with get_db() as db:
         tenants = (
             db.execute(
@@ -1906,10 +2131,10 @@ def render_tenants(user: SessionUser) -> None:
                 with get_db() as db:
                     tenant = db.get(Tenant, tenant_map[selected])
                     active_contract = db.execute(
-                        select(Contract).where(Contract.tenant_id == tenant.tenant_id)
+                        select(Contract).where(Contract.tenant_id == tenant.tenant_id, Contract.status == "active")
                     ).scalar_one_or_none()
                     if active_contract:
-                        st.error("Không thể xóa người thuê đã có hợp đồng")
+                        st.error("Không thể xóa người thuê đang có hợp đồng active")
                     else:
                         old = serialize_model(tenant)
                         tenant_id = tenant.tenant_id
@@ -1919,11 +2144,176 @@ def render_tenants(user: SessionUser) -> None:
                         st.rerun()
 
     with tabs[3]:
+        if not tenants:
+            st.info("Chưa có người thuê để xử lý quá hạn")
+        else:
+            tenant_map = {tenant_label(t): t.tenant_id for t in tenants}
+            selected = st.selectbox("Chọn người thuê bị quá hạn", list(tenant_map.keys()), key="overdue_tenant")
+
+            c1, c2, c3 = st.columns(3)
+            overdue_after_days = int(c1.number_input("Quá hạn từ (ngày)", min_value=1, max_value=120, value=5, step=1))
+            due_day = int(c2.number_input("Ngày đến hạn trong tháng", min_value=1, max_value=28, value=5, step=1))
+            late_fee_amount = c3.number_input("Phí phạt mỗi hóa đơn (VND)", min_value=0, value=200000, step=50000)
+
+            k1, k2 = st.columns(2)
+            auto_mark_overdue = k1.checkbox("Tự động chuyển unpaid -> overdue", value=True)
+            lock_account = k2.checkbox("Khóa tài khoản liên kết của người thuê", value=True)
+
+            with get_db() as db:
+                tenant = db.execute(
+                    select(Tenant)
+                    .options(
+                        joinedload(Tenant.user),
+                        joinedload(Tenant.contracts).joinedload(Contract.room),
+                        joinedload(Tenant.contracts).joinedload(Contract.payments),
+                    )
+                    .where(Tenant.tenant_id == tenant_map[selected])
+                ).unique().scalar_one_or_none()
+
+            if not tenant:
+                st.warning("Không tìm thấy người thuê")
+            else:
+                overdue_rows: list[dict[str, Any]] = []
+                for contract in tenant.contracts:
+                    for payment in contract.payments:
+                        if payment.status not in {"unpaid", "overdue"}:
+                            continue
+                        days_late = overdue_days_from_period(payment.period, due_day=due_day)
+                        if days_late < overdue_after_days:
+                            continue
+                        already_fee = LATE_FEE_MARKER in (payment.note or "")
+                        fee_add = Decimal("0") if already_fee else to_decimal(late_fee_amount)
+                        overdue_rows.append({
+                            "payment_id": payment.payment_id,
+                            "room_code": room_code_text(contract.room),
+                            "period": payment.period,
+                            "status": payment.status,
+                            "days_late": days_late,
+                            "amount_now": to_decimal(payment.amount),
+                            "fee_add": fee_add,
+                            "amount_after": to_decimal(payment.amount) + fee_add,
+                            "already_fee": already_fee,
+                        })
+
+                if not overdue_rows:
+                    st.success("Không có hóa đơn nào đủ điều kiện phạt quá hạn")
+                else:
+                    overdue_rows.sort(key=lambda row: (-row["days_late"], row["period"]))
+                    st.caption(f"Tìm thấy {len(overdue_rows)} hóa đơn quá hạn cần xử lý")
+                    st.dataframe(
+                        pd.DataFrame(
+                            [
+                                {
+                                    "Hóa đơn": row["payment_id"],
+                                    "Phòng": row["room_code"],
+                                    "Kỳ": row["period"],
+                                    "Trạng thái": row["status"],
+                                    "Quá hạn (ngày)": row["days_late"],
+                                    "Số tiền hiện tại": money(row["amount_now"]),
+                                    "Phí phạt dự kiến": money(row["fee_add"]),
+                                    "Sau khi phạt": money(row["amount_after"]),
+                                    "Đã phạt trước": "Có" if row["already_fee"] else "Chưa",
+                                }
+                                for row in overdue_rows
+                            ]
+                        ),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+                    if lock_account and (not tenant.user):
+                        st.info("Người thuê này chưa liên kết tài khoản user, hệ thống sẽ chỉ áp dụng phạt hóa đơn.")
+
+                    if st.button("Áp dụng phạt quá hạn và khóa người thuê", type="primary", use_container_width=True):
+                        late_fee_dec = to_decimal(late_fee_amount)
+                        target_payment_ids = [row["payment_id"] for row in overdue_rows]
+                        affected_count = 0
+                        fee_count = 0
+                        total_fee = Decimal("0")
+                        locked_now = False
+
+                        with get_db() as db:
+                            tenant_write = db.execute(
+                                select(Tenant).options(joinedload(Tenant.user)).where(Tenant.tenant_id == tenant.tenant_id)
+                            ).scalar_one_or_none()
+                            if not tenant_write:
+                                st.error("Không tìm thấy người thuê để cập nhật")
+                            else:
+                                for payment_id in target_payment_ids:
+                                    payment = db.get(Payment, payment_id)
+                                    if not payment or payment.status == "paid":
+                                        continue
+                                    old_payment = serialize_model(payment)
+                                    changed = False
+
+                                    if auto_mark_overdue and payment.status == "unpaid":
+                                        payment.status = "overdue"
+                                        changed = True
+
+                                    if late_fee_dec > 0 and LATE_FEE_MARKER not in (payment.note or ""):
+                                        payment.amount = to_decimal(payment.amount) + late_fee_dec
+                                        payment.note = append_note(
+                                            payment.note,
+                                            f"{LATE_FEE_MARKER} {date.today().isoformat()} +{int(late_fee_dec)}",
+                                        )
+                                        fee_count += 1
+                                        total_fee += late_fee_dec
+                                        changed = True
+
+                                    if changed:
+                                        affected_count += 1
+                                        write_audit_log(
+                                            db,
+                                            user.user_id,
+                                            "payments",
+                                            str(payment.payment_id),
+                                            "update",
+                                            old_data=old_payment,
+                                            new_data=serialize_model(payment),
+                                        )
+
+                                if lock_account and tenant_write.user and tenant_write.user.status != "locked" and affected_count > 0:
+                                    old_user = serialize_model(tenant_write.user)
+                                    tenant_write.user.status = "locked"
+                                    write_audit_log(
+                                        db,
+                                        user.user_id,
+                                        "users",
+                                        str(tenant_write.user.user_id),
+                                        "update",
+                                        old_data=old_user,
+                                        new_data=serialize_model(tenant_write.user),
+                                    )
+                                    create_notification(
+                                        db,
+                                        recipient_id=tenant_write.user.user_id,
+                                        title="Tài khoản tạm khóa do quá hạn thanh toán",
+                                        message=(
+                                            "Tài khoản của bạn đã tạm khóa do có hóa đơn quá hạn. "
+                                            "Vui lòng liên hệ admin để được mở khóa sau khi hoàn tất thanh toán."
+                                        ),
+                                        notification_type="system",
+                                        is_system=True,
+                                    )
+                                    locked_now = True
+
+                        if affected_count == 0:
+                            st.info("Không có thay đổi mới để cập nhật")
+                        else:
+                            st.success(
+                                f"Đã cập nhật {affected_count} hóa đơn, áp dụng phí phạt {fee_count} hóa đơn "
+                                f"(tổng {money(total_fee)})."
+                            )
+                            if locked_now:
+                                st.warning("Tài khoản user liên kết đã được khóa tạm thời.")
+                            st.rerun()
+
+    with tabs[4]:
         if tenants:
             c1, c2 = st.columns([2, 1])
             keyword = c1.text_input("Tìm kiếm người thuê", placeholder="Họ tên, SĐT, Email, CCCD...")
             linked_filter = c2.selectbox("Lọc liên kết tài khoản", ["Tất cả", "Đã liên kết", "Chưa liên kết"])
-            
+
             filtered_tenants = []
             for t in tenants:
                 if keyword:
@@ -3243,45 +3633,168 @@ def render_user_payment_page(user: SessionUser, payment_id: int) -> None:
 
 def render_user_management(user: SessionUser) -> None:
     hero(APP_NAME)
-    section_header("Quản lý User", "Quản trị viên theo dõi và xử lý tài khoản (Ban/Khóa).")
-    with get_db() as db:
-        users = db.execute(select(User).order_by(User.user_id.desc())).scalars().all()
-        
-    c1, c2 = st.columns([2, 1])
-    kw = c1.text_input("Tìm danh sách User")
-    role_filter = c2.selectbox("Lọc quyền", ["Tất cả", "admin", "user"])
-    
-    filtered = []
-    for u in users:
-        if role_filter != "Tất cả" and u.role != role_filter:
-            continue
-        if kw and kw.lower() not in (u.username.lower() + " " + u.full_name.lower()):
-            continue
-        filtered.append(u)
-        
-    for u in filtered:
-        with st.container(border=True):
-            cols = st.columns([3, 1])
-            with cols[0]:
-                st.write(f"**{u.full_name}** (`{u.username}`) - Quyền: {u.role}")
-                st.write(f"Email: {u.email or 'N/A'} | SĐT: {u.phone or 'N/A'}")
-            with cols[1]:
-                new_status = st.selectbox(
-                    "Trạng thái",
-                    ["active", "locked"],
-                    index=["active", "locked"].index(u.status) if u.status in ["active", "locked"] else 0,
-                    key=f"status_{u.user_id}"
-                )
-                if new_status != u.status:
-                    if st.button("Lưu thay đổi", key=f"save_{u.user_id}"):
-                        with get_db() as write_db:
-                            update_user = write_db.get(User, u.user_id)
-                            update_user.status = new_status
-                            write_db.flush()
-                        st.success("Đã cập nhật trạng thái")
-                        st.rerun()
+    section_header("Quản lý User", "Theo dõi trạng thái và xóa tài khoản user an toàn.")
+    tabs = st.tabs(["Khóa/Mở khóa", "Xóa User"])
+
+    with tabs[0]:
+        with get_db() as db:
+            users = db.execute(select(User).order_by(User.user_id.desc())).scalars().all()
+
+        c1, c2 = st.columns([2, 1])
+        kw = c1.text_input("Tìm danh sách User")
+        role_filter = c2.selectbox("Lọc quyền", ["Tất cả", "admin", "user"])
+
+        filtered = []
+        for u in users:
+            if role_filter != "Tất cả" and u.role != role_filter:
+                continue
+            if kw and kw.lower() not in (u.username.lower() + " " + u.full_name.lower()):
+                continue
+            filtered.append(u)
+
+        for u in filtered:
+            with st.container(border=True):
+                cols = st.columns([3, 1])
+                with cols[0]:
+                    st.write(f"**{u.full_name}** (`{u.username}`) - Quyền: {u.role}")
+                    st.write(f"Email: {u.email or 'N/A'} | SĐT: {u.phone or 'N/A'}")
+                with cols[1]:
+                    new_status = st.selectbox(
+                        "Trạng thái",
+                        ["active", "locked"],
+                        index=["active", "locked"].index(u.status) if u.status in ["active", "locked"] else 0,
+                        key=f"status_{u.user_id}",
+                    )
+                    if new_status != u.status and st.button("Lưu thay đổi", key=f"save_{u.user_id}"):
+                        if u.user_id == user.user_id and new_status == "locked":
+                            st.error("Không thể tự khóa tài khoản đang đăng nhập")
+                        else:
+                            with get_db() as write_db:
+                                update_user = write_db.get(User, u.user_id)
+                                if update_user:
+                                    old_data = serialize_model(update_user)
+                                    update_user.status = new_status
+                                    write_db.flush()
+                                    write_audit_log(
+                                        write_db,
+                                        user.user_id,
+                                        "users",
+                                        str(update_user.user_id),
+                                        "update",
+                                        old_data=old_data,
+                                        new_data=serialize_model(update_user),
+                                    )
+                            st.success("Đã cập nhật trạng thái")
+                            st.rerun()
+
+    with tabs[1]:
+        with get_db() as db:
+            users = db.execute(select(User).order_by(User.user_id.desc())).scalars().all()
+
+        user_options = {
+            f"{u.full_name} ({u.username}) - {u.role}": u.user_id
+            for u in users
+            if u.user_id != user.user_id
+        }
+        if not user_options:
+            st.info("Không có user nào để xóa")
+            return
+
+        selected_label = st.selectbox("Chọn user cần xóa", list(user_options.keys()))
+        target_user_id = user_options[selected_label]
+
+        with get_db() as db:
+            target_user = db.get(User, target_user_id)
+            if not target_user:
+                st.warning("Không tìm thấy user")
+                return
+
+            blockers: list[str] = []
+            if target_user.role == "admin":
+                blockers.append("Không cho xóa tài khoản admin")
+
+            owned_room_count = db.scalar(
+                select(func.count(Room.room_id)).where(Room.owner_id == target_user.user_id)
+            ) or 0
+            if owned_room_count > 0:
+                blockers.append(f"User đang sở hữu {owned_room_count} phòng")
+
+            linked_tenant = db.execute(
+                select(Tenant).where(Tenant.user_id == target_user.user_id)
+            ).scalar_one_or_none()
+            if linked_tenant:
+                active_contracts = db.scalar(
+                    select(func.count(Contract.contract_id)).where(
+                        Contract.tenant_id == linked_tenant.tenant_id,
+                        Contract.status == "active",
+                    )
+                ) or 0
+                if active_contracts > 0:
+                    blockers.append("User đang liên kết người thuê có hợp đồng active")
+
+            st.write(f"User được chọn: **{target_user.full_name}** (`{target_user.username}`)")
+            st.write(f"Quyền: `{target_user.role}` | Trạng thái: `{target_user.status}`")
+            if linked_tenant:
+                st.caption(f"Tài khoản đang liên kết tenant #{linked_tenant.tenant_id} ({linked_tenant.full_name}).")
+
+            if blockers:
+                st.error("Không thể xóa user này:")
+                for msg in blockers:
+                    st.write(f"- {msg}")
+            else:
+                st.warning("Thao tác này sẽ xóa user, xóa thông báo liên quan và giữ lịch sử audit (đổi actor về NULL).")
+                if st.button("Xóa user", type="primary", use_container_width=True):
+                    with get_db() as write_db:
+                        user_to_delete = write_db.get(User, target_user_id)
+                        if not user_to_delete:
+                            st.error("User không tồn tại")
+                        else:
+                            linked_tenant_write = write_db.execute(
+                                select(Tenant).where(Tenant.user_id == user_to_delete.user_id)
+                            ).scalar_one_or_none()
+                            old_user_data = serialize_model(user_to_delete)
+
+                            if linked_tenant_write:
+                                old_tenant_data = serialize_model(linked_tenant_write)
+                                linked_tenant_write.user_id = None
+                                write_audit_log(
+                                    write_db,
+                                    user.user_id,
+                                    "tenants",
+                                    str(linked_tenant_write.tenant_id),
+                                    "update",
+                                    old_data=old_tenant_data,
+                                    new_data=serialize_model(linked_tenant_write),
+                                )
+
+                            write_db.execute(
+                                sql_update(AuditLog)
+                                .where(AuditLog.actor_user_id == user_to_delete.user_id)
+                                .values(actor_user_id=None)
+                            )
+                            write_db.execute(
+                                sql_delete(Notification).where(
+                                    or_(
+                                        Notification.sender_id == user_to_delete.user_id,
+                                        Notification.recipient_id == user_to_delete.user_id,
+                                    )
+                                )
+                            )
+                            write_db.delete(user_to_delete)
+                            write_audit_log(
+                                write_db,
+                                user.user_id,
+                                "users",
+                                str(target_user_id),
+                                "delete",
+                                old_data=old_user_data,
+                            )
+
+                    st.success("Đã xóa user thành công")
+                    st.rerun()
 
 def render_user_ai_assistant(user: SessionUser) -> None:
+    load_dotenv(override=True)
     hero(APP_NAME)
     section_header("Trợ lý Người Thuê 🤖", "Hỏi về phòng trọ, hóa đơn, hợp đồng — em trả lời ngay!")
 
@@ -3384,94 +3897,43 @@ Bạn là **Trợ lý AI Người Thuê** của hệ thống quản lý nhà tr�
         with st.chat_message("user" if msg["role"] == "user" else "assistant"):
             st.markdown(msg["parts"][0]["text"])
 
-    # Clear old keys if .env key changed
-    if 'last_env_key' not in st.session_state:
-        st.session_state['last_env_key'] = GEMINI_API_KEY
-    elif st.session_state['last_env_key'] != GEMINI_API_KEY and GEMINI_API_KEY:
-        # .env key changed, clear cached keys
-        st.session_state['user_gemini_key'] = None
-        st.session_state['admin_gemini_key'] = None
-        st.session_state['last_env_key'] = GEMINI_API_KEY
-    
-    # API key selection: prefer session > .env
-    api_key = st.session_state.get("user_gemini_key") or GEMINI_API_KEY
-    
-    # Show clear button if using cached key
-    if st.session_state.get("user_gemini_key"):
-        if st.button("🗑️ Xóa key cũ, dùng key từ .env", key="clear_key"):
-            st.session_state['user_gemini_key'] = None
-            st.rerun()
-    
-    if not GENAI_AVAILABLE or not api_key:
-        st.error("Vui lòng cài đặt thư viện 'google-genai' và nhập API Key ở menu bên trái để sử dụng chức năng này!")
-        st.stop()
+    # OpenAI chạy ngầm cho user, không hiển thị cấu hình.
+    provider = "openai"
+    api_key = (
+        st.session_state.get("user_openai_key")
+        or st.session_state.get("admin_openai_key")
+        or os.getenv("OPENAI_API_KEY", "")
+        or OPENAI_API_KEY
+    )
 
-    with st.chat_message("user"):
-        st.markdown(prompt)
-    
-    chat_history.append({"role": "user", "parts": [{"text": prompt}]})
-    
-    with st.chat_message("assistant"):
-        with st.spinner("Đang suy nghĩ..."):
+    prompt = st.chat_input(
+        "Nhập câu hỏi của bạn...",
+        disabled=(not api_key),
+    )
+    if not api_key:
+        st.caption("Trợ lý tạm thời chưa sẵn sàng. Vui lòng thử lại sau.")
+        return
+
+    if prompt:
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        with st.chat_message("assistant"):
+            with st.spinner("Đang suy nghĩ..."):
                 try:
-                    client = genai.Client(api_key=api_key)
-                    
-                    history_for_api = []
-                    for m in chat_history[:-1]:
-                        history_for_api.append(types.Content(role=m["role"], parts=[types.Part(text=m["parts"][0]["text"])]))
-
-                    response = client.models.generate_content(
-                        model='gemini-2.5-flash',
-                        contents=history_for_api + [prompt],
-                        config=types.GenerateContentConfig(
-                            system_instruction=system_instruction,
-                            temperature=0.3
-                        ),
+                    answer = _call_ai_chat(
+                        provider=provider,
+                        api_key=api_key,
+                        prompt=prompt,
+                        chat_history=chat_history,
+                        system_instruction=system_instruction,
+                        temperature=0.3,
                     )
-                    
-                    answer = response.text
                     st.markdown(answer)
+                    chat_history.append({"role": "user", "parts": [{"text": prompt}]})
                     chat_history.append({"role": "model", "parts": [{"text": answer}]})
-                    st.session_state['user_ai_chat_history'] = chat_history
-                    
+                    st.session_state["user_ai_chat_history"] = chat_history
                 except Exception as e:
-                    error_msg = str(e)
-                    if "403" in error_msg or "PERMISSION_DENIED" in error_msg or "leaked" in error_msg.lower():
-                        st.error("""
-                        🔑 **API Key đã bị khóa!**
-                        
-                        API Key hiện tại đã bị Google đánh dấu là leaked. Vui lòng:
-                        
-                        1. Truy cập: https://aistudio.google.com/app/apikey
-                        2. Tạo API key mới
-                        3. Nhập key mới ở thanh bên trái (phần Cấu hình AI)
-                        
-                        Hoặc nhập trực tiếp API key mới bên dưới:
-                        """)
-                        new_key = st.text_input("API Key mới", type="password", key="new_gemini_key_input")
-                        if new_key and st.button("Cập nhật API Key", key="update_key_btn"):
-                            st.session_state['user_gemini_key'] = new_key
-                            st.success("✅ Đã cập nhật API Key! Vui lòng gửi lại câu hỏi.")
-                            st.rerun()
-                    elif "400" in error_msg or "expired" in error_msg.lower() or "INVALID_ARGUMENT" in error_msg:
-                        st.error("""
-                        ⏰ **API Key đã hết hạn!**
-                        
-                        API Key hiện tại đã hết hạn hoặc không hợp lệ. Vui lòng:
-                        
-                        1. Truy cập: https://aistudio.google.com/app/apikey
-                        2. Tạo API key mới
-                        3. Nhập key mới ở thanh bên trái (phần Cấu hình AI)
-                        
-                        Hoặc nhập trực tiếp API key mới bên dưới:
-                        """)
-                        new_key = st.text_input("API Key mới", type="password", key="new_key_expired")
-                        if new_key and st.button("Cập nhật API Key", key="update_btn_expired"):
-                            st.session_state['user_gemini_key'] = new_key
-                            st.success("✅ Đã cập nhật API Key! Vui lòng gửi lại câu hỏi.")
-                            st.rerun()
-                    else:
-                        st.error(f"Lỗi khi gọi API: {error_msg}")
+                    st.error(f"Lỗi khi gọi API: {str(e)}")
 
     if st.button("🗑️ Xóa lịch sử chat"):
         st.session_state['user_ai_chat_history'] = []
@@ -3480,6 +3942,7 @@ Bạn là **Trợ lý AI Người Thuê** của hệ thống quản lý nhà tr�
 
 
 def render_ai_agent(user: SessionUser) -> None:
+    load_dotenv(override=True)
     hero(APP_NAME)
     section_header("AI Agent Vận Hành 🤖", "Trợ lý AI chuyên biệt: truy vấn DB, phân tích rủi ro, tối ưu giá và tóm tắt vận hành.")
 
@@ -3504,12 +3967,7 @@ def render_ai_agent(user: SessionUser) -> None:
     tabs = st.tabs(["💬 Chat AI Agent", "⚡ Tác vụ Tự động", "📊 Báo cáo nhanh"])
 
     with tabs[0]:
-        with st.sidebar:
-            st.markdown("---")
-            st.markdown("### 🔑 Cấu hình AI Admin")
-            api_key_input = st.text_input("Gemini API Key", value=st.session_state.get('admin_gemini_key', GEMINI_API_KEY), type="password", key="ai_key_admin")
-            if api_key_input:
-                st.session_state['admin_gemini_key'] = api_key_input
+        st.caption("AI Agent đang chạy ngầm với OpenAI.")
 
         # Prepare context summary
         avail_rooms = [r for r in rooms if r.status == 'available']
@@ -3557,35 +4015,33 @@ Bạn là **AI Agent Vận Hành** chuyên nghiệp, hỗ trợ Admin quản lý
                 st.markdown(msg["parts"][0]["text"])
 
         if prompt := st.chat_input("Hỏi AI Agent về dữ liệu hệ thống (VD: Phòng trống, doanh thu, công nợ)..."):
-            api_key = st.session_state.get("admin_gemini_key", GEMINI_API_KEY)
-            if not GENAI_AVAILABLE or not api_key:
-                st.error("Vui lòng cài đặt thư viện 'google-genai' và nhập API Key ở menu bên trái để sử dụng chức năng này!")
+            provider = "openai"
+            api_key = (
+                st.session_state.get("admin_openai_key")
+                or st.session_state.get("user_openai_key")
+                or os.getenv("OPENAI_API_KEY", "")
+                or OPENAI_API_KEY
+            )
+            if not api_key:
+                st.error("Chưa cấu hình OPENAI_API_KEY.")
                 st.stop()
 
-            chat_history.append({"role": "user", "parts": [{"text": prompt}]})
             with st.chat_message("user"):
                 st.markdown(prompt)
 
             with st.chat_message("assistant"):
                 with st.spinner("Đang chạy phân tích..."):
                     try:
-                        client = genai.Client(api_key=api_key)
-                        
-                        history_for_api = []
-                        for m in chat_history[:-1]:
-                            history_for_api.append(types.Content(role=m["role"], parts=[types.Part(text=m["parts"][0]["text"])]))
-
-                        response = client.models.generate_content(
-                            model='gemini-2.5-flash',
-                            contents=history_for_api + [prompt],
-                            config=types.GenerateContentConfig(
-                                system_instruction=system_instruction,
-                                temperature=0.1
-                            ),
+                        answer = _call_ai_chat(
+                            provider=provider,
+                            api_key=api_key,
+                            prompt=prompt,
+                            chat_history=chat_history,
+                            system_instruction=system_instruction,
+                            temperature=0.1,
                         )
-                        
-                        answer = response.text
                         st.markdown(answer)
+                        chat_history.append({"role": "user", "parts": [{"text": prompt}]})
                         chat_history.append({"role": "model", "parts": [{"text": answer}]})
                         st.session_state['admin_ai_chat_history'] = chat_history
                         
@@ -3691,8 +4147,6 @@ def main() -> None:
             render_user_management(user)
         elif selected in ("📨 Trung tâm Thông báo", "Trung tâm Thông báo"):
             render_admin_notifications(user)
-        elif selected == "Trợ lý AI":
-            render_ai_agent(user)
     else:
         # Note: Inline QR payment is now handled in render_user_payments
         if selected == "Danh sách phòng":
@@ -3705,8 +4159,6 @@ def main() -> None:
             render_user_payments(user)
         elif selected in ("🔔 Thông báo của tôi", "Thông báo của tôi"):
             render_user_notifications(user)
-        elif selected == "Trợ lý AI":
-            render_user_ai_assistant(user)
 
 
 def render_admin_notifications(user: SessionUser) -> None:
@@ -4097,7 +4549,6 @@ def render_sidebar_with_notifications(user: SessionUser) -> str:
                     ("📋", "Audit Log", "Lịch sử thay đổi"),
                     ("👤", "Quản lý User", "Tài khoản người dùng"),
                     ("📨", "📨 Trung tâm Thông báo", "Gửi & quản lý thông báo"),
-                    ("🤖", "Trợ lý AI", "AI Agent vận hành"),
                 ],
             }
             flat_options = [item[1] for group in menu_groups.values() for item in group]
@@ -4110,7 +4561,6 @@ def render_sidebar_with_notifications(user: SessionUser) -> str:
                     ("📄", "Hợp đồng của tôi", "Hợp đồng đang có"),
                     ("💳", "Hóa đơn của tôi", "Thanh toán MoMo"),
                     ("🔔", f"🔔 Thông báo của tôi", f"Thông báo{badge}"),
-                    ("🤖", "Trợ lý AI", "Hỏi đáp tự động"),
                 ],
             }
             flat_options = [item[1] for group in menu_groups.values() for item in group]
@@ -4512,7 +4962,6 @@ def render_sidebar_with_notifications(user: SessionUser) -> str:
                 ("📋", "Audit Log"),
                 ("👤", "Quản lý User"),
                 ("📨", "📨 Trung tâm Thông báo"),
-                ("🤖", "Trợ lý AI"),
             ]
         else:
             notify_label = "Thông báo của tôi"
@@ -4524,7 +4973,6 @@ def render_sidebar_with_notifications(user: SessionUser) -> str:
                 ("📄", "Hợp đồng của tôi"),
                 ("💳", "Hóa đơn của tôi"),
                 ("🔔", notify_label),
-                ("🤖", "Trợ lý AI"),
             ]
 
         canonical_labels = [label for _, label in menu_items]
